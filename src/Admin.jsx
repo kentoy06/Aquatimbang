@@ -1,6 +1,149 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import "./App.css";
 import "./Admin.css";
+
+
+// Read-only audit records supplied by Django. This endpoint enforces role visibility.
+function useDjangoActivityLogs() {
+  const [records, setRecords] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [refreshKey, setRefreshKey] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      setLoading(true);
+      setError("");
+      try {
+        const token = localStorage.getItem("authToken");
+        if (!token) throw new Error("Please log in again to view activity logs.");
+        let next = "http://127.0.0.1:8000/api/activity-logs/";
+        const all = [];
+        const visited = new Set();
+        while (next && !visited.has(next)) {
+          visited.add(next);
+          const response = await fetch(next, { headers: { Authorization: `Token ${token}` } });
+          if (!response.ok) throw new Error(`Unable to load activity logs (HTTP ${response.status}).`);
+          const data = await response.json();
+          if (Array.isArray(data)) {
+            all.push(...data);
+            next = null;
+          } else if (Array.isArray(data.results)) {
+            all.push(...data.results);
+            next = data.next ? new URL(data.next, next).href : null;
+          } else {
+            throw new Error("Unexpected activity logs response.");
+          }
+        }
+        if (!cancelled) setRecords(all);
+      } catch (err) {
+        if (!cancelled) setError(err.message);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+    load();
+    return () => { cancelled = true; };
+  }, [refreshKey]);
+  return { records, loading, error, refresh: () => setRefreshKey(k => k + 1) };
+}
+
+function formatAuditTimestamp(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString("en-PH", { dateStyle: "medium", timeStyle: "short" });
+}
+function formatAuditDetails(details) {
+  if (!details || (typeof details === "object" && Object.keys(details).length === 0)) return "—";
+  if (typeof details === "string") return details;
+  return Object.entries(details).map(([key, value]) => `${key.replaceAll("_", " ")}: ${typeof value === "object" ? JSON.stringify(value) : String(value)}`).join(" · ");
+}
+
+// Presentation-only helpers; the audit records remain unchanged in Django.
+function auditLabel(key) {
+  return String(key).replaceAll("_", " ").replace(/\b\w/g, c => c.toUpperCase());
+}
+function auditValue(value) {
+  if (value === true) return "Active";
+  if (value === false) return "Inactive";
+  if (value === null || value === undefined || value === "") return "—";
+  if (Array.isArray(value)) return value.map(auditValue).join(", ");
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+function auditDetailLines(details) {
+  if (!details) return [];
+  if (typeof details === "string") return [{ key: "Details", value: details }];
+  return Object.entries(details).flatMap(([key, value]) => {
+    if (key === "changes" && value && typeof value === "object" && !Array.isArray(value)) {
+      return Object.entries(value).map(([field, change]) => ({
+        key: auditLabel(field),
+        value: change && typeof change === "object" && ("from" in change || "to" in change)
+          ? `${auditValue(change.from)} → ${auditValue(change.to)}` : auditValue(change),
+      }));
+    }
+    return [{ key: auditLabel(key), value: auditValue(value) }];
+  });
+}
+function auditSummary(log) {
+  const lines = auditDetailLines(log.details);
+  return lines.length ? lines.slice(0, 2).map(item => `${item.key}: ${item.value}`).join(" · ") : "No additional details";
+}
+function AuditActionBadge({ action }) {
+  const type = String(action || "").toLowerCase();
+  const palette = type.includes("deactivat") || type.includes("delet") || type.includes("reject")
+    ? { bg: "#fff1f2", fg: "#be123c", border: "#fecdd3" }
+    : type.includes("activat") || type.includes("creat") || type.includes("approv")
+      ? { bg: "#dcfce7", fg: "#166534", border: "#86efac" }
+      : { bg: "#e0f2fe", fg: "#075985", border: "#7dd3fc" };
+  return <span style={{ display: "inline-block", padding: "5px 10px", borderRadius: 999, fontSize: 12, fontWeight: 700, background: palette.bg, color: palette.fg, border: `1px solid ${palette.border}`, whiteSpace: "nowrap" }}>{auditLabel(action || "Unknown")}</span>;
+}
+function auditModule(log) {
+  const type = String(log.target_type || "").toLowerCase().replaceAll("_", " ");
+  if (type.includes("price")) return "Price Records";
+  if (type.includes("species") || type.includes("fishspecies")) return "Fish Species";
+  if (type.includes("user") || type.includes("profile") || type.includes("account")) return "User Management";
+  if (type.includes("municipality") || type.includes("market")) return "Municipality & Market";
+  if (type.includes("suggestion")) return "Fisherfolk Suggestions";
+  if (type.includes("announcement")) return "System Announcements";
+  return log.target_type ? auditLabel(log.target_type) : "Other";
+}
+
+function AuditDetailsDialog({ log, onClose }) {
+  useEffect(() => {
+    if (!log) return;
+    const onKey = event => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [log, onClose]);
+  if (!log) return null;
+  const items = auditDetailLines(log.details);
+  return <div role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }} style={{ position: "fixed", inset: 0, zIndex: 99999, background: "rgba(15,23,42,.6)", display: "flex", justifyContent: "center", alignItems: "center", padding: 16 }}>
+    <section role="dialog" aria-modal="true" aria-labelledby="audit-detail-heading" style={{ background: "#fff", color: "#172033", borderRadius: 16, width: "min(100%, 560px)", maxHeight: "85vh", overflowY: "auto", boxShadow: "0 20px 65px rgba(0,0,0,.24)", padding: 24 }}>
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16 }}>
+        <div><h3 id="audit-detail-heading" style={{ margin: "0 0 10px" }}>Activity Details</h3><AuditActionBadge action={log.action}/></div>
+        <button type="button" onClick={onClose} aria-label="Close activity details" style={{ border: "1px solid #d5dce5", borderRadius: 8, background: "#fff", padding: "6px 12px", cursor: "pointer", color: "#172033" }}>✕</button>
+      </div>
+      <dl style={{ display: "grid", gridTemplateColumns: "minmax(100px, 140px) minmax(0, 1fr)", gap: "12px 16px", marginTop: 24, overflowWrap: "anywhere" }}>
+        {[["Date & Time", formatAuditTimestamp(log.created_at)], ["User", log.actor_username || "—"], ["Role", log.actor_role || "—"], ["Module", auditModule(log)], ["Record Type", log.target_type || "—"], ["Affected Record", log.target_name || "—"], ...items.map(item => [item.key, item.value])].map(([key, value], index) => <React.Fragment key={`${key}-${index}`}><dt style={{ color: "#64748b", fontWeight: 600 }}>{key}</dt><dd style={{ margin: 0, whiteSpace: "pre-wrap" }}>{value}</dd></React.Fragment>)}
+      </dl>
+      <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 24 }}><button type="button" className="secondary-btn" onClick={onClose}>Close</button></div>
+    </section>
+  </div>;
+}
+
+function exportAuditCsv(records, filename) {
+  const cols = ["Date", "User", "Role", "Module", "Action", "Affected Record", "Details"];
+  const quote = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
+  const rows = records.map(l => [formatAuditTimestamp(l.created_at), l.actor_username, l.actor_role, auditModule(l), l.action, l.target_name, formatAuditDetails(l.details)]);
+  const csv = "\uFEFF" + [cols, ...rows].map(row => row.map(quote).join(",")).join("\r\n");
+  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 /* ================================================================
    CONSTANTS & MOCK DATA GENERATORS
@@ -18,6 +161,17 @@ const peso = (n) => {
   if (n === null || n === undefined || isNaN(n)) return "—";
   return `₱${Number(n).toLocaleString("en-PH", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 };
+
+const mapDatabaseSpecies = (fish) => ({
+  id: fish.id,
+  name: fish.name,
+  scientific: fish.scientific_name || "",
+  description: fish.description || "",
+  status: fish.is_active ? "Active" : "Inactive",
+  dateAdded: fish.created_at
+    ? new Date(fish.created_at).toLocaleDateString("en-PH")
+    : "—",
+});
 
 const fmtDate = (isoStr) => {
   const d = new Date(isoStr + "T00:00:00");
@@ -281,8 +435,6 @@ function buildNotifications(users, priceRecords, species, markets, forecasts, an
 }
 
 
-
-
 /* ================================================================
    ROOT ADMIN COMPONENT
    ================================================================ */
@@ -290,6 +442,149 @@ function buildNotifications(users, priceRecords, species, markets, forecasts, an
 function Admin({ onLogout }) {
   const [activePage, setActivePage] = useState("Dashboard");
   const [toast, setToast] = useState("");
+
+  // Tracks whether user accounts are loading from Django.
+  const [usersLoading, setUsersLoading] = useState(false);
+
+    // Pending registrations retrieved from Django.
+  const [pendingRegistrations, setPendingRegistrations] = useState([]);
+
+  // Stores registered users retrieved from Django.
+  const [databaseUsers, setDatabaseUsers] = useState([]);
+
+  // Tracks loading and errors for registered users.
+  const [databaseUsersLoading, setDatabaseUsersLoading] = useState(false);
+  const [databaseUsersError, setDatabaseUsersError] = useState("");
+
+  // Stores any error while loading pending accounts.
+  const [usersError, setUsersError] = useState("");
+
+    // Load pending registrations from the Django backend.
+  useEffect(() => {
+    const fetchPendingRegistrations = async () => {
+      const token = localStorage.getItem("authToken");
+
+      if (!token) {
+        setUsersError("Administrator session not found. Please log in again.");
+        return;
+      }
+
+      setUsersLoading(true);
+      setUsersError("");
+
+      try {
+        const response = await fetch(
+          "http://127.0.0.1:8000/api/auth/users/pending/",
+          {
+            method: "GET",
+            headers: {
+              Authorization: `Token ${token}`,
+            },
+          }
+        );
+
+        if (!response.ok) {
+          throw new Error(
+            response.status === 403
+              ? "Administrator access is required."
+              : response.status === 401
+              ? "Your session has expired. Please log in again."
+              : "Failed to load pending registrations."
+          );
+        }
+
+               const data = await response.json();
+
+        // Django may return a paginated response.
+        const users = Array.isArray(data)
+          ? data
+          : data.results;
+
+        if (!Array.isArray(users)) {
+          throw new Error(
+            "The server returned an unexpected registration format."
+          );
+        }
+
+        setPendingRegistrations(users);
+        setUsersError("");
+
+        console.log(
+          "Pending registrations loaded:",
+          users.length
+        );
+      } catch (err) {
+        setUsersError(err.message);
+        console.error("Pending registrations error:", err);
+      } finally {
+        setUsersLoading(false);
+      }
+    };
+
+    fetchPendingRegistrations();
+  }, []);
+
+  // Load registered AquaTimbang users from Django.
+useEffect(() => {
+  const fetchDatabaseUsers = async () => {
+    const token = localStorage.getItem("authToken");
+
+    if (!token) {
+      setDatabaseUsersError("Administrator session not found.");
+      return;
+    }
+
+    setDatabaseUsersLoading(true);
+    setDatabaseUsersError("");
+
+    try {
+      const response = await fetch(
+        "http://127.0.0.1:8000/api/auth/users/",
+        {
+          method: "GET",
+          headers: {
+            Authorization: `Token ${token}`,
+          },
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(
+          response.status === 403
+            ? "Administrator access is required."
+            : response.status === 401
+            ? "Your session has expired."
+            : "Failed to load registered users."
+        );
+      }
+
+      const data = await response.json();
+
+      // Supports both plain arrays and paginated responses.
+      const accounts = Array.isArray(data)
+        ? data
+        : data.results;
+
+      if (!Array.isArray(accounts)) {
+        throw new Error("Unexpected user list format.");
+      }
+
+      setDatabaseUsers(accounts);
+
+      console.log("Registered users loaded:", accounts.length);
+      console.log("Registered user list:", accounts);
+
+    } catch (error) {
+      console.error("Registered users error:", error);
+      setDatabaseUsersError(error.message);
+
+    } finally {
+      setDatabaseUsersLoading(false);
+    }
+  };
+
+  fetchDatabaseUsers();
+}, []);
 
   /* ---------- SHARED STATE ---------- */
 
@@ -305,13 +600,45 @@ function Admin({ onLogout }) {
     { id: 8, name: "System Admin", email: "admin@aquatimbang.ph", username: "sysadmin", contact: "0917 000 0001", role: "System Administrator", municipality: "Cebu City", status: "Active", registeredDate: "01/01/2026", approvedDate: "01/01/2026", lastLogin: "09/16/2026 08:55 AM", loginCount: 210, logoutCount: 205, online: true },
   ]);
 
-  const [species, setSpecies] = useState([
-    { id: 1, name: "Galunggong", scientific: "Decapterus macarellus", description: "Round scad, most commonly traded wet fish.", dateAdded: "01/12/2026", status: "Active" },
-    { id: 2, name: "Tulingan", scientific: "Euthynnus affinis", description: "Mackerel tuna, sold whole or sliced.", dateAdded: "01/12/2026", status: "Active" },
-    { id: 3, name: "Bolinaw", scientific: "Stolephorus spp.", description: "Anchovy, sold fresh or for bagoong.", dateAdded: "01/15/2026", status: "Active" },
-    { id: 4, name: "Tamarong", scientific: "Local catch", description: "Locally caught species in Pasil market.", dateAdded: "02/03/2026", status: "Active" },
-    { id: 5, name: "Anduhaw", scientific: "Rastrelliger spp.", description: "Indian mackerel, seasonal demand.", dateAdded: "02/03/2026", status: "Inactive" },
-  ]);
+  const [species, setSpecies] = useState([]);
+
+// LOAD FISH SPECIES FROM DJANGO DATABASE
+useEffect(() => {
+  const loadFishSpecies = async () => {
+    try {
+      const token = localStorage.getItem("authToken");
+
+      const response = await fetch(
+        "http://127.0.0.1:8000/api/fish-species/",
+        {
+          headers: {
+            Authorization: `Token ${token}`,
+          },
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`Failed to load fish species (${response.status})`);
+      }
+
+      const data = await response.json();
+
+      const records = Array.isArray(data)
+        ? data
+        : data.results;
+
+      if (!Array.isArray(records)) {
+        throw new Error("Unexpected fish species response.");
+      }
+
+      setSpecies(records.map(mapDatabaseSpecies));
+    } catch (error) {
+      console.error("Fish species loading error:", error);
+    }
+  };
+
+  loadFishSpecies();
+}, []);
 
   const [municipalities, setMunicipalities] = useState([
     { id: 1, name: "Cebu City", status: "Active" },
@@ -429,12 +756,23 @@ function Admin({ onLogout }) {
   const renderPage = () => {
     switch (activePage) {
       case "User Management":
-        return (
-          <UserManagement
-            users={users} setUsers={setUsers}
-            notify={notify} addLog={addLog} logs={logs}
-          />
-        );
+       return (
+  <UserManagement
+    users={users}
+    setUsers={setUsers}
+    notify={notify}
+    addLog={addLog}
+    logs={logs}
+    pendingRegistrations={pendingRegistrations}
+    usersLoading={usersLoading} 
+    usersError={usersError}
+    setPendingRegistrations={setPendingRegistrations}
+    databaseUsers={databaseUsers}
+    setDatabaseUsers={setDatabaseUsers}
+    databaseUsersLoading={databaseUsersLoading}
+    databaseUsersError={databaseUsersError}
+  />
+);
       case "Fish Species":
         return (
           <FishSpecies
@@ -514,12 +852,20 @@ function Admin({ onLogout }) {
           />
         );
       default:
-        return (
-          <Dashboard
-            users={users} species={species} priceRecords={priceRecords}
-            markets={markets} logs={logs} goTo={setActivePage}
-          />
-        );
+      return (
+  <Dashboard
+    users={users}
+    species={species}
+    priceRecords={priceRecords}
+    markets={markets}
+    logs={logs}
+    goTo={setActivePage}
+    pendingRegistrations={pendingRegistrations}
+    usersLoading={usersLoading}
+    usersError={usersError}
+    databaseUsers={databaseUsers}
+  />
+);
     }
   };
 
@@ -614,7 +960,18 @@ function Admin({ onLogout }) {
    DASHBOARD
    ================================================================ */
 
-function Dashboard({ users, species, priceRecords, markets, logs, goTo }) {
+function Dashboard({
+  users,
+  species,
+  priceRecords,
+  markets,
+  logs,
+  goTo,
+  pendingRegistrations,
+  databaseUsers,
+  usersLoading,
+  usersError,
+}) {
   const pending = users.filter((u) => u.status === "Pending");
   const activeUsers = users.filter((u) => u.status === "Active");
   const onlineUsers = activeUsers.filter((u) => u.online);
@@ -667,19 +1024,19 @@ function Dashboard({ users, species, priceRecords, markets, logs, goTo }) {
           <div className="stat-icon blue">♙</div>
           <div>
             <span>Total Users</span>
-            <h2>{users.length}</h2>
+            <h2>{databaseUsers.length}</h2>
             <small>Registered accounts</small>
           </div>
         </div>
 
         <div className="stat-card clickable" onClick={() => goTo("User Management")}>
-          <div className="stat-icon orange">⏳</div>
-          <div>
-            <span>Pending Approvals</span>
-            <h2>{pending.length}</h2>
-            <small>Awaiting review</small>
-          </div>
-        </div>
+  <div className="stat-icon orange">⏳</div>
+  <div>
+    <span>Pending Approvals</span>
+    <h2>{usersLoading ? "..." : usersError ? "—" : pendingRegistrations.length}</h2>
+    <small>Awaiting review</small>
+  </div>
+</div>
 
         <div className="stat-card clickable" onClick={() => goTo("User Management")}>
           <div className="stat-icon green">●</div>
@@ -869,59 +1226,281 @@ function municipalitiesCount(markets) {
    USER MANAGEMENT
    ================================================================ */
 
-function UserManagement({ users, setUsers, notify, addLog, logs }) {
+function UserManagement({
+  users,
+  setUsers,
+  notify,
+  addLog,
+  logs,
+  pendingRegistrations,
+  setPendingRegistrations,
+  databaseUsers,
+  setDatabaseUsers,
+  databaseUsersLoading,
+  databaseUsersError,
+  usersLoading,
+  usersError,
+}) {
   const [tab, setTab] = useState("Pending");
   const [search, setSearch] = useState("");
   const [roleFilter, setRoleFilter] = useState("All Roles");
   const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState(null);
   const [viewing, setViewing] = useState(null);
+  const [documentLoading, setDocumentLoading] = useState(false);
+  const [reviewingUser, setReviewingUser] = useState(null);
+  const [reviewAction, setReviewAction] = useState("");
+  const [rejectionReason, setRejectionReason] = useState("");
+  const [reviewSaving, setReviewSaving] = useState(false);
+  const [reviewConfirmed, setReviewConfirmed] = useState(false);
+  const openVerificationDocument = async (userId, documentType) => {
+  const token = localStorage.getItem("authToken");
+
+  if (!token) {
+    notify("Please log in again.");
+    return;
+  }
+
+  // Open a blank tab immediately so browsers don't block it.
+  const newTab = window.open("", "_blank");
+
+  if (!newTab) {
+    notify("Please allow pop-ups to view verification documents.");
+    return;
+  }
+
+  newTab.document.title = "Loading verification document";
+  newTab.document.body.textContent = "Loading document securely...";
+
+  setDocumentLoading(true);
+
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:8000/api/auth/users/${userId}/verification/${documentType}/`,
+      {
+        headers: {
+          Authorization: `Token ${token}`,
+        },
+      }
+    );
+
+    if (!response.ok) {
+  let errorMessage = `Document request failed (HTTP ${response.status}).`;
+
+  if (response.status === 401) {
+    errorMessage = "Your login session is invalid or has expired.";
+  } else if (response.status === 403) {
+    errorMessage = "Administrator permission denied.";
+  } else if (response.status === 404) {
+    errorMessage = "Verification document or API endpoint not found.";
+  } else if (response.status === 500) {
+    errorMessage = "Django encountered a server error while opening the document.";
+  }
+
+  throw new Error(errorMessage);
+}
+
+    const blob = await response.blob();
+    const fileUrl = URL.createObjectURL(blob);
+
+    newTab.location.replace(fileUrl);
+
+    // Allow the browser time to load the document.
+    setTimeout(() => URL.revokeObjectURL(fileUrl), 60000);
+  } catch (error) {
+    newTab.close();
+    notify(error.message);
+  } finally {
+    setDocumentLoading(false);
+  }
+};
   const [form, setForm] = useState({
     name: "", email: "", username: "", password: "", contact: "",
     role: "Fish Vendor", municipality: "Cebu City",
   });
 
-  const pendingCount = users.filter((u) => u.status === "Pending").length;
+  // Convert Django pending registrations into the format
+  // expected by the existing User Management table.
+  const databasePendingUsers = pendingRegistrations.map((account) => ({
+    id: account.id,
+    name: `${account.first_name || ""} ${account.last_name || ""}`.trim(),
+    username: account.username,
+    email: account.email,
+    role: account.role === "LGU Officer" ? "LGU Personnel" : account.role,
+    municipality: account.municipality || "",
+    contact: account.contact_number || "",
+    status: "Pending",
+    online: false,
+    source: "database",
+    verification: account.verification,
+    registeredDate: account.registered_at
+    ? new Date(account.registered_at).toLocaleDateString("en-PH")
+    : "—",
+    lastLogin: "Never",
+  }));
+
+  // Keep sample users available in the other tabs for now,
+  // but exclude their sample pending registrations.
+  const combinedUsers = databaseUsers.map((account) => ({
+  id: account.id,
+  name: `${account.first_name || ""} ${account.last_name || ""}`.trim(),
+  username: account.username,
+  email: account.email,
+  role: account.role === "LGU Officer"
+    ? "LGU Personnel"
+    : account.role,
+  municipality: account.municipality || "",
+  contact: account.contact_number || "",
+  status:
+  account.account_status === "rejected"
+    ? "Rejected"
+    : account.account_status === "pending"
+    ? "Pending"
+    : account.account_status === "approved"
+    ? "Active"
+    : account.is_active
+    ? "Active"
+    : "Pending",
+  online: false,
+  source: "database",
+  verification: account.verification,
+  registeredDate: account.registered_at
+  ? new Date(account.registered_at).toLocaleDateString("en-PH")
+  : "—",
+  lastLogin: account.last_login
+  ? new Date(account.last_login).toLocaleString("en-PH")
+  : "Never",
+  accountStatus: account.account_status,
+  rejectionReason: account.rejection_reason || "",
+  reviewedAt: account.reviewed_at || null,
+  reviewedBy: account.reviewed_by || null,
+}));
+
+  const pendingCount = pendingRegistrations.length;
   const onlineCount = users.filter((u) => u.online).length;
   const offlineCount = users.filter((u) => u.status === "Active" && !u.online).length;
 
-  const visible = users
-    .filter((u) => {
-      if (tab === "Pending") return u.status === "Pending";
-      if (tab === "Inactive") return u.status === "Inactive";
-      return true;
-    })
+  const visible = (
+  tab === "Pending"
+    ? databasePendingUsers
+    : tab === "Inactive"
+    ? combinedUsers.filter(
+        (u) => u.status === "Inactive" || u.status === "Rejected"
+      )
+    : combinedUsers
+)
     .filter((u) => roleFilter === "All Roles" || u.role === roleFilter)
     .filter((u) =>
       [u.name, u.username, u.email, u.municipality].join(" ").toLowerCase().includes(search.toLowerCase())
     );
 
-  const approve = (u) => {
-    if (u.role === "LGU Personnel" &&
-      !window.confirm(
-        `${u.name} is requesting an LGU Officer account. Have you verified their identity and government position? ` +
-        `You can change their role to Fish Vendor from Edit if they are not an LGU officer.`
-      )
-    ) return;
+    const approve = (u) => {
+  setReviewingUser(u);
+  setReviewAction("approve");
+  setReviewConfirmed(false);
+  setRejectionReason("");
+};
 
-    setUsers((prev) =>
-      prev.map((x) =>
-        x.id === u.id
-          ? { ...x, status: "Active", approvedDate: new Date().toLocaleDateString("en-PH") }
-          : x
+const reject = (u) => {
+  setReviewingUser(u);
+  setReviewAction("reject");
+  setRejectionReason("");
+};
+
+const submitReview = async () => {
+  if (!reviewingUser || reviewSaving) return;
+
+  const reason = rejectionReason.trim();
+
+  if (reviewAction === "approve" && !reviewConfirmed) {
+  notify("Please confirm that you reviewed the applicant's verification documents.");
+  return;
+}
+
+  if (reviewAction === "reject" && !reason) {
+    notify("Please provide a reason for rejection.");
+    return;
+  }
+
+  const token = localStorage.getItem("authToken");
+
+  if (!token) {
+    notify("Your session has expired. Please log in again.");
+    return;
+  }
+
+  setReviewSaving(true);
+
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:8000/api/auth/users/${reviewingUser.id}/${reviewAction}/`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Token ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(
+          reviewAction === "reject"
+            ? { reason: reason }
+            : { verification_confirmed: true }
+        ),
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      notify(
+        data.message ||
+        data.detail ||
+        `Unable to ${reviewAction} this account.`
+      );
+      return;
+    }
+
+    setPendingRegistrations((prev) =>
+      prev.filter((account) => account.id !== reviewingUser.id)
+    );
+
+    setDatabaseUsers((prev) =>
+      prev.map((account) =>
+        account.id === reviewingUser.id
+          ? {
+              ...account,
+              is_active: reviewAction === "approve",
+              account_status:
+                reviewAction === "approve" ? "approved" : "rejected",
+              rejection_reason:
+                reviewAction === "reject" ? reason : "",
+                reviewed_at: data.reviewed_at || null,
+            }
+          : account
       )
     );
-    addLog(`Approved user: ${u.name}`, "User Management");
-    notify(`${u.name} approved.`);
-  };
 
-  const reject = (u) => {
-    if (!window.confirm(`Reject the registration of ${u.name}?`)) return;
-    setUsers((prev) => prev.filter((x) => x.id !== u.id));
-    addLog(`Rejected user: ${u.name}`, "User Management");
-    notify(`${u.name} rejected.`);
-  };
+    addLog(
+      `${reviewAction === "approve" ? "Approved" : "Rejected"} user: ${reviewingUser.name}`,
+      "User Management"
+    );
 
+    notify(
+      `${reviewingUser.name} ${
+        reviewAction === "approve" ? "approved" : "rejected"
+      } successfully.`
+    );
+
+    setReviewingUser(null);
+    setReviewAction("");
+    setRejectionReason("");
+    setReviewConfirmed(false);
+  } catch (error) {
+    console.error("Account review failed:", error);
+    notify("Unable to connect to the Django server.");
+  } finally {
+    setReviewSaving(false);
+  }
+};
   const toggleStatus = (u) => {
     const next = u.status === "Active" ? "Inactive" : "Active";
 
@@ -1035,7 +1614,7 @@ function UserManagement({ users, setUsers, notify, addLog, logs }) {
       <div className="log-summary">
         <div className="mini-stat">
           <span>Total Users</span>
-          <strong>{users.length}</strong>
+          <strong>{databaseUsers.length}</strong>
         </div>
         <div className="mini-stat">
           <span>Pending Approval</span>
@@ -1135,6 +1714,116 @@ function UserManagement({ users, setUsers, notify, addLog, logs }) {
         </div>
       )}
 
+{reviewingUser && (
+  <div
+    className="modal-backdrop"
+    onClick={() => !reviewSaving && setReviewingUser(null)}
+  >
+    <div
+      className="modal"
+      onClick={(e) => e.stopPropagation()}
+    >
+      <div className="modal-head">
+        <h3>
+          {reviewAction === "approve"
+            ? "Approve Registration"
+            : "Reject Registration"}
+        </h3>
+
+        <button
+          className="modal-close"
+          disabled={reviewSaving}
+          onClick={() => setReviewingUser(null)}
+        >
+          ✕
+        </button>
+      </div>
+
+      <p>
+        <strong>{reviewingUser.name}</strong>
+      </p>
+
+      <p>
+        {reviewingUser.role} · {reviewingUser.municipality}
+      </p>
+
+      {reviewAction === "approve" ? (
+        <div className="info-box">
+  <label
+    style={{
+      display: "flex",
+      alignItems: "flex-start",
+      gap: "10px",
+      cursor: "pointer",
+    }}
+  >
+    <input
+      type="checkbox"
+      checked={reviewConfirmed}
+      onChange={(e) => setReviewConfirmed(e.target.checked)}
+      disabled={reviewSaving}
+      style={{
+        width: "18px",
+        height: "18px",
+        flexShrink: 0,
+        marginTop: "2px",
+        accentColor: "#087f8c",
+      }}
+    />
+
+    <span>
+      I confirm that I have reviewed the applicant's
+      identity, registration details, and required
+      verification documents.
+    </span>
+  </label>
+</div>
+      ) : (
+        <div className="form-group">
+          <label>Reason for Rejection *</label>
+
+          <textarea
+            value={rejectionReason}
+            onChange={(e) =>
+              setRejectionReason(e.target.value)
+            }
+            placeholder="Explain why this registration is being rejected..."
+            rows={4}
+            disabled={reviewSaving}
+            style={{ width: "100%", resize: "vertical" }}
+          />
+        </div>
+      )}
+
+      <div className="button-row">
+        <button
+          className="secondary-btn"
+          disabled={reviewSaving}
+          onClick={() => setReviewingUser(null)}
+        >
+          Cancel
+        </button>
+
+        <button
+          className="primary-btn"
+          disabled={
+            reviewSaving ||
+            (reviewAction === "approve" && !reviewConfirmed) ||
+            (reviewAction === "reject" && !rejectionReason.trim())
+          }
+          onClick={submitReview}
+        >
+          {reviewSaving
+            ? "Saving..."
+            : reviewAction === "approve"
+            ? "Confirm Approval"
+            : "Confirm Rejection"}
+        </button>
+      </div>
+    </div>
+  </div>
+)}
+
       {viewing && (
         <div className="modal-backdrop" onClick={() => setViewing(null)}>
           <div className="modal profile-modal" onClick={(e) => e.stopPropagation()}>
@@ -1193,6 +1882,86 @@ function UserManagement({ users, setUsers, notify, addLog, logs }) {
               </div>
             </div>
 
+{viewing.verification?.type && (
+  <>
+    <div className="mini-head">Registration Verification</div>
+
+    <div className="profile-grid">
+      {Object.entries(viewing.verification.details || {}).map(
+        ([key, value]) => (
+          <div className="profile-field" key={key}>
+            <span>
+              {key.replaceAll("_", " ").replace(/\b\w/g, (c) =>
+                c.toUpperCase()
+              )}
+            </span>
+            <strong>{value || "Not provided"}</strong>
+          </div>
+        )
+      )}
+    </div>
+
+    <div className="mini-head">Submitted Documents</div>
+
+    <div className="button-row">
+      {viewing.verification.documents?.permit && (
+        <button
+          className="secondary-btn"
+          disabled={documentLoading}
+          onClick={() =>
+            openVerificationDocument(viewing.id, "vendor-permit")
+          }
+        >
+          View Vendor Permit
+        </button>
+      )}
+
+      {viewing.verification.documents?.stall_photo && (
+        <button
+          className="secondary-btn"
+          disabled={documentLoading}
+          onClick={() =>
+            openVerificationDocument(viewing.id, "vendor-stall")
+          }
+        >
+          View Stall Photo
+        </button>
+      )}
+
+      {viewing.verification.documents?.authorization && (
+        <button
+          className="secondary-btn"
+          disabled={documentLoading}
+          onClick={() =>
+            openVerificationDocument(viewing.id, "lgu-authorization")
+          }
+        >
+          View LGU Authorization
+        </button>
+      )}
+    </div>
+
+    {!Object.values(viewing.verification.documents || {}).some(Boolean) && (
+      <p>No verification documents were uploaded.</p>
+    )}
+  </>
+)}
+
+{viewing.status === "Rejected" && (
+  <>
+    <div className="mini-head">Rejection Details</div>
+
+    <div className="profile-grid">
+      <div className="profile-field">
+        <span>Rejection Reason</span>
+        <strong>
+          {viewing.rejectionReason || "Not provided"}
+        </strong>
+      </div>
+    </div>
+  </>
+)}
+
             <div className="mini-head">Account History</div>
             <div className="history-list">
               {userHistory(viewing).length === 0 ? (
@@ -1211,9 +1980,13 @@ function UserManagement({ users, setUsers, notify, addLog, logs }) {
             </div>
 
             <div className="button-row">
-              <button className="secondary-btn" onClick={() => { setViewing(null); openEdit(viewing); }}>
-                Edit User
-              </button>
+              <button
+  className="secondary-btn"
+  disabled
+  title="Database-backed user editing is not implemented yet"
+>
+  Edit User (Coming Soon)
+</button>
               <button className="primary-btn" onClick={() => setViewing(null)}>Close</button>
             </div>
           </div>
@@ -1338,7 +2111,7 @@ function FishSpecies({ species, setSpecies, priceRecords, notify, addLog }) {
   const [editing, setEditing] = useState(null);
   const [viewing, setViewing] = useState(null);
   const [form, setForm] = useState({ name: "", scientific: "", description: "" });
-
+  const [speciesSaving, setSpeciesSaving] = useState(false);
   const visible = species.filter((s) =>
     [s.name, s.scientific, s.description].join(" ").toLowerCase().includes(search.toLowerCase())
   );
@@ -1357,46 +2130,176 @@ function FishSpecies({ species, setSpecies, priceRecords, notify, addLog }) {
     setShowForm(true);
   };
 
-  const save = () => {
-    if (!form.name.trim()) {
-      notify("Species name is required.");
-      return;
-    }
+  const speciesRequest = async (url, method, body = null) => {
+  const token = localStorage.getItem("authToken");
 
-    if (editing) {
-      setSpecies((prev) => prev.map((x) => (x.id === editing.id ? { ...x, ...form } : x)));
-      addLog(`Updated species: ${form.name}`, "Fish Species");
-      notify("Species updated.");
-    } else {
-      setSpecies((prev) => [
-        ...prev,
-        { ...form, id: Date.now(), status: "Active", dateAdded: new Date().toLocaleDateString("en-PH") },
-      ]);
-      addLog(`Added species: ${form.name}`, "Fish Species");
-      notify("Species added.");
-    }
+  if (!token) {
+    throw new Error("Your session has expired. Please log in again.");
+  }
 
+  const response = await fetch(url, {
+    method,
+    headers: {
+      Authorization: `Token ${token}`,
+      ...(body !== null ? { "Content-Type": "application/json" } : {}),
+    },
+    ...(body !== null ? { body: JSON.stringify(body) } : {}),
+  });
+
+  if (response.ok) {
+    return response.status === 204 ? null : response.json();
+  }
+
+  let details = null;
+
+  try {
+    details = await response.json();
+  } catch {
+    // The server may return an HTML error page.
+  }
+
+  const message =
+    details?.message ||
+    details?.detail ||
+    (details && Object.entries(details)
+      .map(([field, errors]) =>
+        `${field}: ${Array.isArray(errors) ? errors.join(", ") : errors}`
+      )
+      .join("; ")) ||
+    `Request failed (${response.status}).`;
+
+  throw new Error(message);
+};
+
+  const save = async () => {
+  if (speciesSaving) return;
+
+  const name = form.name.trim();
+
+  if (!name) {
+    notify("Species name is required.");
+    return;
+  }
+
+  const payload = {
+    name,
+    scientific_name: form.scientific.trim(),
+    description: form.description.trim(),
+  };
+
+  setSpeciesSaving(true);
+
+  try {
+    const url = editing
+      ? `http://127.0.0.1:8000/api/fish-species/${editing.id}/`
+      : "http://127.0.0.1:8000/api/fish-species/";
+
+    const result = await speciesRequest(
+      url,
+      editing ? "PATCH" : "POST",
+      payload
+    );
+
+    const updated = mapDatabaseSpecies(result);
+
+    setSpecies((prev) =>
+      editing
+        ? prev.map((item) =>
+            item.id === editing.id ? updated : item
+          )
+        : [...prev, updated]
+    );
+
+    addLog(
+      `${editing ? "Updated" : "Added"} species: ${updated.name}`,
+      "Fish Species"
+    );
+
+    notify(editing ? "Species updated successfully." : "Species added successfully.");
     setShowForm(false);
-  };
+    setEditing(null);
+  } catch (error) {
+    console.error("Fish species save error:", error);
+    notify(error.message);
+  } finally {
+    setSpeciesSaving(false);
+  }
+};
 
-  const toggleStatus = (s) => {
-    const next = s.status === "Active" ? "Inactive" : "Active";
+const toggleStatus = async (s) => {
+  if (speciesSaving) return;
 
-    if (next === "Inactive" &&
-      !window.confirm(`Deactivate ${s.name}? It will be hidden from dropdowns across the system.`)
-    ) return;
+  const nextActive = s.status !== "Active";
 
-    setSpecies((prev) => prev.map((x) => (x.id === s.id ? { ...x, status: next } : x)));
-    addLog(`${next === "Active" ? "Reactivated" : "Deactivated"} species: ${s.name}`, "Fish Species");
-    notify(`${s.name} is now ${next.toLowerCase()}.`);
-  };
+  if (
+    !nextActive &&
+    !window.confirm(`Deactivate ${s.name}? It will no longer be available for new price entries.`)
+  ) {
+    return;
+  }
 
-  const remove = (s) => {
-    if (!window.confirm(`Delete ${s.name}? This cannot be undone.`)) return;
-    setSpecies((prev) => prev.filter((x) => x.id !== s.id));
+  setSpeciesSaving(true);
+
+  try {
+    const result = await speciesRequest(
+      `http://127.0.0.1:8000/api/fish-species/${s.id}/`,
+      "PATCH",
+      { is_active: nextActive }
+    );
+
+    const updated = mapDatabaseSpecies(result);
+
+    setSpecies((prev) =>
+      prev.map((item) => item.id === s.id ? updated : item)
+    );
+
+    addLog(
+      `${nextActive ? "Reactivated" : "Deactivated"} species: ${s.name}`,
+      "Fish Species"
+    );
+
+    notify(`${s.name} is now ${nextActive ? "active" : "inactive"}.`);
+  } catch (error) {
+    console.error("Species status error:", error);
+    notify(error.message);
+  } finally {
+    setSpeciesSaving(false);
+  }
+};
+
+ const remove = async (s) => {
+  if (speciesSaving) return;
+
+  if (recordsFor(s.name).length > 0) {
+    notify("This species has price records. Deactivate it instead of deleting.");
+    return;
+  }
+
+  if (!window.confirm(
+    `Permanently delete ${s.name}? This action cannot be undone.`
+  )) {
+    return;
+  }
+
+  setSpeciesSaving(true);
+
+  try {
+    await speciesRequest(
+      `http://127.0.0.1:8000/api/fish-species/${s.id}/`,
+      "DELETE"
+    );
+
+    setSpecies((prev) => prev.filter((item) => item.id !== s.id));
+
     addLog(`Deleted species: ${s.name}`, "Fish Species");
-    notify(`${s.name} deleted.`);
-  };
+    notify(`${s.name} deleted successfully.`);
+  } catch (error) {
+    console.error("Species deletion error:", error);
+    notify(error.message);
+  } finally {
+    setSpeciesSaving(false);
+  }
+};
 
   const initials = (name) => name.slice(0, 2).toUpperCase();
 
@@ -1435,7 +2338,7 @@ function FishSpecies({ species, setSpecies, priceRecords, notify, addLog }) {
 
             <div className="button-row">
               <button className="secondary-btn" onClick={() => setShowForm(false)}>Cancel</button>
-              <button className="primary-btn" onClick={save}>{editing ? "Save Changes" : "Add Species"}</button>
+              <button className="primary-btn" onClick={save} disabled={speciesSaving}>{speciesSaving ? "Saving..." : editing ? "Save Changes" : "Add Species"}</button>
             </div>
           </div>
         </div>
@@ -2234,137 +3137,94 @@ function SystemConfiguration({ config, setConfig, notify, addLog }) {
    ACTIVITY LOGS
    ================================================================ */
 
-function ActivityLogs({ logs, notify }) {
-  const [tab, setTab] = useState("All Logs");
+function ActivityLogs({ notify }) {
+  const [selectedLog, setSelectedLog] = useState(null);
+  const { records, loading, error, refresh } = useDjangoActivityLogs();
   const [search, setSearch] = useState("");
-  const [filter, setFilter] = useState("All Activities");
+  const [action, setAction] = useState("All Actions");
+  const [role, setRole] = useState("All Roles");
+  const [moduleFilter, setModuleFilter] = useState("All Modules");
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
 
-  const corrections = logs.filter((l) => l.action.toLowerCase().includes("corrected"));
-
-  const base = tab === "Audit Trail" ? corrections : logs;
-
-  const visible = base
-    .filter((l) => tab === "Audit Trail" || filter === "All Activities" || l.module === filter)
-    .filter((l) => [l.user, l.role, l.action, l.module].join(" ").toLowerCase().includes(search.toLowerCase()));
-
-  const exportLogs = () => {
-    const header = "User,Role,Module,Action,Date,Status\n";
-    const body = visible.map((l) => `"${l.user}","${l.role}","${l.module}","${l.action}","${l.date}","${l.status}"`).join("\n");
-
-    const blob = new Blob([header + body], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = tab === "Audit Trail" ? "audit_trail_corrections.csv" : "activity_logs.csv";
-    a.click();
-    URL.revokeObjectURL(url);
-
-    notify(`${tab === "Audit Trail" ? "Audit trail" : "Activity logs"} exported.`);
-  };
+  const actions = [...new Set(records.map(l => l.action).filter(Boolean))].sort();
+  const roles = [...new Set(records.map(l => l.actor_role).filter(Boolean))].sort();
+  const modules = [...new Set(records.map(auditModule))].sort();
+  const visible = records.filter(l => {
+    const day = l.created_at ? l.created_at.slice(0, 10) : "";
+    return (action === "All Actions" || l.action === action)
+      && (role === "All Roles" || l.actor_role === role)
+      && (moduleFilter === "All Modules" || auditModule(l) === moduleFilter)
+      && (!from || day >= from) && (!to || day <= to)
+      && [l.actor_username, l.actor_role, auditModule(l), l.action, l.target_name, l.target_type, formatAuditDetails(l.details)]
+        .join(" ").toLowerCase().includes(search.toLowerCase());
+  });
 
   return (
     <>
       <div className="page-title">
         <div>
           <h2>Activity Logs</h2>
-          <p>Monitor administrative actions, user activity, and correction history.</p>
+          <p>Permanent activity records from Django for supported AquaTimbang modules.</p>
         </div>
-        <button className="secondary-btn" onClick={exportLogs}>↓ Export Logs</button>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button className="secondary-btn" onClick={refresh} disabled={loading}>↻ Refresh</button>
+          <button className="secondary-btn" disabled={!visible.length} onClick={() => {
+            exportAuditCsv(visible, "aquatimbang_activity_logs.csv");
+            notify("Activity logs exported.");
+          }}>↓ Export CSV</button>
+        </div>
       </div>
-
       <div className="log-summary">
-        <div className="mini-stat">
-          <span>Total Activities</span>
-          <strong>{logs.length}</strong>
-        </div>
-        <div className="mini-stat">
-          <span>Showing</span>
-          <strong>{visible.length}</strong>
-        </div>
-        <div className="mini-stat">
-          <span>Correction Events</span>
-          <strong>{corrections.length}</strong>
-        </div>
-        <div className="mini-stat">
-          <span>User Management</span>
-          <strong>{logs.filter((l) => l.module === "User Management").length}</strong>
-        </div>
+        <div className="mini-stat"><span>Recorded Events</span><strong>{records.length}</strong></div>
+        <div className="mini-stat"><span>Showing</span><strong>{visible.length}</strong></div>
+        <div className="mini-stat"><span>Users</span><strong>{new Set(records.map(l => l.actor_username).filter(Boolean)).size}</strong></div>
       </div>
-
       <div className="panel">
-        <div className="tabs">
-          <button className={tab === "All Logs" ? "tab active-tab" : "tab"} onClick={() => setTab("All Logs")}>
-            All Logs
-          </button>
-          <button className={tab === "Audit Trail" ? "tab active-tab" : "tab"} onClick={() => setTab("Audit Trail")}>
-            Audit Trail (Corrections)
-            {corrections.length > 0 && <span className="tab-count">{corrections.length}</span>}
-          </button>
+        <div className="table-tools" style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+          <div className="search-box">🔍 <input placeholder="Search user, module, record, or details..." value={search} onChange={e => setSearch(e.target.value)} /></div>
+          <select value={moduleFilter} onChange={e => setModuleFilter(e.target.value)}>
+            <option>All Modules</option>{modules.map(m => <option key={m}>{m}</option>)}
+          </select>
+          <select value={action} onChange={e => setAction(e.target.value)}>
+            <option>All Actions</option>{actions.map(a => <option key={a}>{a}</option>)}
+          </select>
+          <select value={role} onChange={e => setRole(e.target.value)}>
+            <option>All Roles</option>{roles.map(r => <option key={r}>{r}</option>)}
+          </select>
+          <label>From <input type="date" value={from} max={to || undefined} onChange={e => setFrom(e.target.value)} /></label>
+          <label>To <input type="date" min={from || undefined} value={to} onChange={e => setTo(e.target.value)} /></label>
         </div>
-
-        <div className="table-tools">
-          <div className="search-box">
-            🔍
-            <input type="text" placeholder="Search activity..." value={search} onChange={(e) => setSearch(e.target.value)} />
-          </div>
-
-          {tab === "All Logs" && (
-            <select value={filter} onChange={(e) => setFilter(e.target.value)}>
-              <option>All Activities</option>
-              <option>Authentication</option>
-              <option>User Management</option>
-              <option>Fish Species</option>
-              <option>Municipality & Market</option>
-              <option>Price Records</option>
-              <option>Configuration</option>
-            </select>
-          )}
-        </div>
-
-        {tab === "Audit Trail" && (
-          <div className="info-box" style={{ margin: "0 20px 16px" }}>
-            Every price correction made in Price Records is logged here automatically,
-            with the old and new price preserved in the action text for a full audit trail.
-          </div>
-        )}
-
-        <table>
-          <thead>
-            <tr>
-              <th>USER</th>
-              <th>ROLE</th>
-              <th>MODULE</th>
-              <th>ACTION</th>
-              <th>DATE</th>
-              <th>STATUS</th>
-            </tr>
-          </thead>
-          <tbody>
-            {visible.length === 0 ? (
-              <tr>
-                <td colSpan="6" className="empty-row">
-                  {tab === "Audit Trail" ? "No corrections recorded yet." : "No activities found."}
-                </td>
-              </tr>
-            ) : (
-              visible.map((l) => (
-                <tr key={l.id}>
-                  <td><strong>{l.user}</strong></td>
-                  <td>{l.role}</td>
-                  <td>{l.module}</td>
-                  <td>{l.action}</td>
-                  <td>{l.date}</td>
-                  <td><span className="badge success">{l.status}</span></td>
-                </tr>
-              ))
-            )}
-          </tbody>
-        </table>
+        {loading && <p style={{ padding: 20 }}>Loading activity logs from Django...</p>}
+        {error && <p role="alert" style={{ padding: 20, color: "#b91c1c" }}>{error}</p>}
+        {!loading && !error && <div style={{ overflowX: "auto" }}>
+          <table>
+            <thead><tr><th>DATE &amp; TIME</th><th>USER</th><th>ROLE</th><th>MODULE</th><th>ACTION</th><th>AFFECTED RECORD</th><th>DETAILS</th></tr></thead>
+            <tbody>
+              {visible.length === 0
+                ? <tr><td colSpan="7" className="empty-row">No recorded activity matches your filters.</td></tr>
+                : visible.map(l => <tr key={l.id}>
+                    <td>{formatAuditTimestamp(l.created_at)}</td>
+                    <td><strong>{l.actor_username || "—"}</strong></td>
+                    <td>{l.actor_role || "—"}</td>
+                    <td>{auditModule(l)}</td>
+                    <td><AuditActionBadge action={l.action} /></td>
+                    <td>{l.target_name || "—"}</td>
+                    <td style={{ maxWidth: 360, overflowWrap: "anywhere" }}>
+                      <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 6 }}>
+                        <span>{auditSummary(l)}</span>
+                        <button type="button" className="secondary-btn" onClick={() => setSelectedLog(l)} style={{ padding: "5px 10px", fontSize: 12 }}>View Details</button>
+                      </div>
+                    </td>
+                  </tr>)}
+            </tbody>
+          </table>
+        </div>}
       </div>
+      <AuditDetailsDialog log={selectedLog} onClose={() => setSelectedLog(null)} />
     </>
   );
 }
-
 
 /* ================================================================
    FISHERFOLK SUGGESTED PRICE MONITORING
